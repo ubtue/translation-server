@@ -7,10 +7,10 @@ RUN apt-get update \
 	# Install node and npm
 	&& mkdir /tmp/node-build \
 	&& cd /tmp/node-build \
-	&& wget --quiet -O node.xz https://nodejs.org/dist/v8.1.2/node-v8.1.2-linux-x64.tar.xz \
+	&& wget --quiet -O node.xz https://nodejs.org/dist/v8.9.4/node-v8.9.4-linux-x64.tar.xz \
 	&& tar xf node.xz \
-	&& mv node-v8.1.2-linux-x64/bin/node /usr/bin/ \
-	&& node-v8.1.2-linux-x64/bin/npm install -g npm \
+	&& mv node-v8.9.4-linux-x64/bin/node /usr/bin/ \
+	&& node-v8.9.4-linux-x64/bin/npm install -g npm \
 	&& cd \
 	&& rm -rf /tmp/node-build
 
@@ -26,7 +26,7 @@ RUN cd /opt/translation-server/modules/zotero \
 	&& rm -rf zotero \
 	&& mkdir zotero \
 	&& mv /tmp/zotero-build zotero/build \
-	
+	\
 	# Build translation-server and make build files the main dir
 	&& cd /opt/translation-server \
 	&& bash fetch_sdk \
@@ -37,7 +37,7 @@ RUN cd /opt/translation-server/modules/zotero \
 	&& rm -rf translation-server \
 	&& mv translation-server2 translation-server \
 	&& cd translation-server \
-	
+	\
 	# Create translators repository
 	&& git clone https://github.com/zotero/translators app/translators
 
