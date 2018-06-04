@@ -146,6 +146,17 @@ Zotero.Server.Translation = new function() {
 	};
 };
 
+Zotero.Server.Translation.Root = function() {};
+Zotero.Server.Endpoints["/"] = Zotero.Server.Translation.Root;
+Zotero.Server.Translation.Root.prototype = {
+	"supportedMethods":["GET"],
+	
+	init: async function (requestData) {
+		return [200];
+	}
+
+}
+
 /**
  * Translates a web page
  *
@@ -179,29 +190,55 @@ Zotero.Server.Translation.Web.prototype = {
 		}
 		
 		try {
-			var url = Services.io.newURI(data.url, "UTF-8", null);
-		} catch(e) {}
-		
-		if(!url || (!url.schemeIs("http") && !url.schemeIs("https"))) {
+			var nsIURL = Services.io.newURI(data.url, "UTF-8", null);
+		}
+		catch(e) {}
+		if (!nsIURL || (!nsIURL.schemeIs("http") && !nsIURL.schemeIs("https"))) {
 			sendResponseCallback(400, "text/plain", "Invalid URL specified\n");
 			return;
+		}
+		
+		let m = data.url.match(/https?:\/\/([^/]+)/);
+		if (m) {
+			let domain = m[1];
+			let blacklisted = Zotero.Prefs.get("blacklistedDomains")
+				.split(',')
+				.some(x => x && new RegExp(x).test(domain));
+			if (blacklisted) {
+				let doi = Zotero.Utilities.cleanDOI(data.url);
+				if (doi) {
+					return sendResponseCallback(...(await Zotero.Server.Translation.Search.prototype.init({data: doi})));
+				}
+				else {
+					return sendResponseCallback(500, "text/plain", "An error occurred retrieving the document\n");
+				}
+			}
 		}
 		
 		// If a doi.org URL, use search handler
 		if (data.url.match(/^https?:\/\/[^\/]*doi\.org\//)) {
 			let doi = Zotero.Utilities.cleanDOI(data.url);
-			return Zotero.Server.Translation.Search.prototype.init(url, doi, sendResponseCallback);
+			return sendResponseCallback(...(await Zotero.Server.Translation.Search.prototype.init({data: doi})));
 		}
 		
-		var runningInstance
-		if((runningInstance = Zotero.Server.Translation.waitingForSelection[data.sessionid])
-				&& data.items) {
-			// Already waiting for a items response, so just pass this there
-			runningInstance._cookieSandbox.setTimeout(SERVER_TRANSLATION_TIMEOUT*1000,
-				runningInstance.timeout.bind(runningInstance));
-			runningInstance.sendResponse = sendResponseCallback;
-			runningInstance.selectDone(data.items);
-		} else {
+		var urlsToTry = Zotero.Prefs.get('deproxifyURLs') ? this.deproxifyURL(data.url) : [data.url];
+		for (let i = 0; i < urlsToTry.length; i++) {
+			let url = urlsToTry[i];
+			if (urlsToTry.length > 1) {
+				Zotero.debug("Trying " + url);
+			}
+			
+			let runningInstance;
+			if ((runningInstance = Zotero.Server.Translation.waitingForSelection[data.sessionid])
+					&& data.items) {
+				// Already waiting for a items response, so just pass this there
+				runningInstance._cookieSandbox.setTimeout(SERVER_TRANSLATION_TIMEOUT*1000,
+					runningInstance.timeout.bind(runningInstance));
+				runningInstance.sendResponse = sendResponseCallback;
+				runningInstance.selectDone(data.items);
+				break;
+			}
+			
 			// New request
 			this.sendResponse = sendResponseCallback;
 			this._data = data;
@@ -209,14 +246,14 @@ Zotero.Server.Translation.Web.prototype = {
 			this._cookieSandbox.setTimeout(SERVER_TRANSLATION_TIMEOUT*1000,
 				this.timeout.bind(this));
 			
-			var translate = this._translate = new Zotero.Translate.Web();
+			let translate = this._translate = new Zotero.Translate.Web();
 			translate.setHandler("translators", this.translators.bind(this));
 			translate.setHandler("select", this.select.bind(this));
 			translate.setCookieSandbox(this._cookieSandbox);
 			
 			try {
 				await Zotero.HTTP.processDocuments(
-					[url.spec],
+					[url],
 					(doc) => {
 						translate.setDocument(doc);
 						// This could be optimized by only running detect on secondary translators
@@ -225,10 +262,22 @@ Zotero.Server.Translation.Web.prototype = {
 					},
 					this._cookieSandbox
 				);
+				break;
 			}
 			catch (e) {
 				Zotero.debug(e, 1);
-				sendResponseCallback(500, "text/plain", "An error occurred retrieving the document\n");
+				
+				//Parse URL up to '?' for DOI
+				let doi = Zotero.Utilities.cleanDOI(decodeURIComponent(data.url).match(/[^\?]+/)[0]);
+				if (doi) {
+					Zotero.debug("Found DOI in URL -- continuing with " + doi);
+					return sendResponseCallback(...(await Zotero.Server.Translation.Search.prototype.init({data: doi})));
+				}
+				
+				// No more URLs to try
+				if (i == urlsToTry.length - 1) {
+					sendResponseCallback(500, "text/plain", "An error occurred retrieving the document\n");
+				}
 			}
 		}
 		
@@ -325,6 +374,67 @@ Zotero.Server.Translation.Web.prototype = {
 		
 		this.sendResponse(200, "application/json", JSON.stringify(items));
 	},
+	
+	
+	/**
+	 * Try to determine whether the passed URL looks like a proxied URL based on TLDs in the
+	 * middle of the domain and return a list of likely URLs, starting with the longest domain
+	 * and ending with the original one
+	 *
+	 * E.g., https://www-example-co-uk.mutex.gmu.edu ->
+	 *
+	 * [
+	 *   'https://www.example.co.uk',
+	 *   'https://www.example.co',
+	 *   'https://www-example-co-uk.mutex.gmu.edu',
+	 * ]
+	 *
+	 * Based on Zotero.Proxies.getPotentialProxies()
+	 */
+	deproxifyURL: function (url) {
+		var urlToProxy = {
+			[url]: null
+		};
+		
+		// if there is a subdomain that is also a TLD, also test against URI with the domain
+		// dropped after the TLD
+		// (i.e., www.nature.com.mutex.gmu.edu => www.nature.com)
+		var m = /^(https?:\/\/)([^\/]+)/i.exec(url);
+		if (m) {
+			// First, drop the 0- if it exists (this is an III invention)
+			var host = m[2];
+			if (host.substr(0, 2) === "0-") host = host.substr(2);
+			var hostnameParts = [host.split(".")];
+			if (m[1] == 'https://') {
+				// try replacing hyphens with dots for https protocol
+				// to account for EZProxy HttpsHypens mode
+				hostnameParts.push(host.split('.'));
+				hostnameParts[1].splice(0, 1, ...(hostnameParts[1][0].replace(/-/g, '.').split('.')));
+			}
+			
+			for (let i=0; i < hostnameParts.length; i++) {
+				let parts = hostnameParts[i];
+				// If hostnameParts has two entries, then the second one is with replaced hyphens
+				let dotsToHyphens = i == 1;
+				// skip the lowest level subdomain, domain and TLD
+				for (let j=1; j<parts.length-2; j++) {
+					// if a part matches a TLD, everything up to it is probably the true URL
+					if (TLDS[parts[j].toLowerCase()]) {
+						var properHost = parts.slice(0, j+1).join(".");
+						// protocol + properHost + /path
+						var properURL = m[1]+properHost + url.substr(m[0].length);
+						var proxyHost = parts.slice(j + 1).join('.');
+						urlToProxy[properURL] = {scheme: '%h.' + proxyHost + '/%p', dotsToHyphens};
+					}
+				}
+			}
+		}
+		var urls = Object.keys(urlToProxy);
+		urls.sort((a, b) => b.length - a.length);
+		urls.push(urls.shift());
+		return urls;
+	},
+	
 	
 	/**
 	 * Called if multiple items are available for selection
@@ -506,16 +616,77 @@ Zotero.Server.Translation.Search.prototype = {
 	supportedMethods: ["POST"],
 	supportedDataTypes: ["text/plain"],
 	
-	init: async function (url, data, sendResponseCallback) {
+	init: async function (requestData) {
+		var data = requestData.data;
 		if (!data) {
-			sendResponseCallback(400, "text/plain", "No input provided\n");
-			return;
+			return [400, "text/plain", "No input provided\n"];
 		}
 		
-		var identifiers = Zotero.Utilities.Internal.extractIdentifiers(data);
+		let identifiers = Zotero.Utilities.Internal.extractIdentifiers(data);
+		
+		// Use PMID only if it's the only text in the query
+		if (identifiers.length && identifiers[0].PMID && identifiers[0].PMID !== data.trim()) {
+			identifiers = [];
+		}
+		
 		if (!identifiers.length) {
-			sendResponseCallback(400, "text/plain", "No identifiers found in input\n");
-			return;
+			let result = await this.textSearch.search(
+				data,
+				requestData.query && requestData.query.start
+			);
+			
+			// Throw selection if two or more items are found, or the selection flag is marked
+			if (result.items.length >= 2 || result.items.length >= 1 && result.select) {
+				let newItems = {};
+				
+				for (let item of result.items) {
+					let DOI = item.DOI;
+					let ISBN = item.ISBN;
+					
+					if (!DOI && item.extra) {
+						let m = item.extra.match(/DOI: (.*)/);
+						if (m) DOI = m[1];
+					}
+					
+					if (!ISBN && item.extra) {
+						let m = item.extra.match(/ISBN: (.*)/);
+						if (m) ISBN = m[1];
+					}
+					
+					let identifier;
+					// DOI has a priority over ISBN for items that have both
+					if (DOI) {
+						identifier = DOI;
+					}
+					else if (item.ISBN) {
+						identifier = ISBN.split(' ')[0];
+					}
+					
+					newItems[identifier] = {
+						itemType: item.itemType,
+						title: item.title,
+						description: this.textSearch.formatDescription(item),
+					};
+				}
+				
+				let headers = {
+					'Content-Type': 'application/json'
+				};
+				// If there were more results, include a link to the next result set
+				if (result.next) {
+					headers.Link = `</search?start=${result.next}>; rel="next"`;
+				}
+				return [300, headers, JSON.stringify(newItems)];
+			}
+			else if (result.items.length === 1) {
+				return [
+					200,
+					"application/json",
+					JSON.stringify(Zotero.Utilities.itemToAPIJSON(result.items[0]))
+				];
+			}
+			
+			return [200, "application/json", "[]"];
 		}
 		
 		try {
@@ -523,8 +694,7 @@ Zotero.Server.Translation.Search.prototype = {
 			translate.setIdentifier(identifiers[0]);
 			let translators = await translate.getTranslators();
 			if (!translators.length) {
-				sendResponseCallback(501, "text/plain", "No translators available\n");
-				return;
+				return [501, "text/plain", "No translators available\n"];
 			}
 			translate.setTranslator(translators);
 			
@@ -534,22 +704,20 @@ Zotero.Server.Translation.Search.prototype = {
 		}
 		catch (e) {
 			if (e == translate.ERROR_NO_RESULTS) {
-				sendResponseCallback(
+				return [
 					501,
 					"text/plain",
 					e + "\n"
-				);
+				];
 			}
-			else {
-				Zotero.debug(e, 1);
-				sendResponseCallback(
-					500,
-					"text/plain",
-					"An error occurred during translation. "
-						+ "Please check translation with the Zotero client.\n"
-				);
-			}
-			return;
+			
+			Zotero.debug(e, 1);
+			return [
+				500,
+				"text/plain",
+				"An error occurred during translation. "
+					+ "Please check translation with the Zotero client.\n"
+			];
 		}
 		
 		// Translation can return multiple items (e.g., a parent item and notes pointing to it),
@@ -559,10 +727,406 @@ Zotero.Server.Translation.Search.prototype = {
 			newItems.push(...Zotero.Utilities.itemToAPIJSON(item));
 		});
 		
-		sendResponseCallback(200, "application/json", JSON.stringify(newItems));
-	}
-};
+		return [200, "application/json", JSON.stringify(newItems)];
+	},
+	
+	textSearch: new function () {
+		this.search = async function (query, start) {
+			const numResults = 3;
+			let identifiers;
+			let moreResults = false;
+			try {
+				let xmlhttp = await Zotero.HTTP.request(
+					"GET",
+					Zotero.Prefs.get("identifierSearchURL") + encodeURIComponent(query),
+					{
+						timeout: 15000
+					}
+				);
+				identifiers = JSON.parse(xmlhttp.responseText);
+				
+				// If passed a start= parameter, skip ahead
+				let startPos = 0;
+				if (start) {
+					for (let i = 0; i < identifiers.length; i++) {
+						if (identifierToToken(identifiers[i]) == start) {
+							startPos = i + 1;
+							break;
+						}
+					}
+				}
+				
+				if (identifiers.length > startPos + numResults + 1) {
+					moreResults = true;
+				}
+				
+				identifiers = identifiers.slice(startPos);
+			} catch(e) {
+				Zotero.debug(e, 1);
+				return {select: false, items: []};
+			}
+			
+			let items = [];
+			let nextLastIdentifier = null;
+			for (let identifier of identifiers) {
+				let translate = new Zotero.Translate.Search();
+				try {
+					translate.setIdentifier(identifier);
+					let translators = await translate.getTranslators();
+					if (!translators.length) {
+						continue;
+					}
+					translate.setTranslator(translators);
+					
+					let newItems = await translate.translate({
+						libraryID: false
+					});
 
+					if (newItems.length) {
+						let seq = getLongestCommonSequence(newItems[0].title, query);
+						if (seq.length >= 6 && seq.split(' ').length >= 2) {
+							items.push(newItems[0]);
+							// Keep track of last identifier if we're limiting results
+							if (moreResults) {
+								nextLastIdentifier = identifier;
+							}
+							if (items.length == numResults) {
+								break;
+							}
+						}
+					}
+				}
+				catch (e) {
+					if (e !== translate.ERROR_NO_RESULTS) {
+						Zotero.debug(e, 1);
+					}
+				}
+			}
+			
+			return {
+				// Force item selection, even for a single item
+				select: true,
+				items,
+				next: nextLastIdentifier ? identifierToToken(nextLastIdentifier) : null
+			};
+			
+			// // Query Crossref and LoC/GBV in parallel to respond faster to the client
+			// let [crossrefItems, libraryItems] = await Promise.all([queryCrossref(query), queryLibraries(query)]);
+			//
+			// // Subtract book reviews from Crossref
+			// crossrefItems = subtractCrossrefItems(crossrefItems, libraryItems);
+			//
+			// let items = crossrefItems.concat(libraryItems);
+			//
+			// // Filter out too fuzzy items, by comparing item title (and other metadata) against query
+			// return await filterResults(items, query);
+		};
+		
+		function subtractCrossrefItems(crossrefItems, libraryItems) {
+			let items = [];
+			for(let crossrefItem of crossrefItems) {
+				// Keep books and book sections
+				if(['book', 'bookSection'].includes(crossrefItem.itemType)) {
+					items.push(crossrefItem);
+					continue;
+				}
+				
+				let crossrefTitle = crossrefItem.title;
+				// Remove all tags
+				crossrefTitle = crossrefTitle.replace(/<\/?\w+[^<>]*>/gi, '');
+				crossrefTitle = crossrefTitle.replace(/:/g, ' ');
+				
+				// Normalize title, split to words, filter out empty array elements
+				crossrefTitle = normalize(crossrefTitle).split(' ').filter(x => x).join(' ');
+				
+				let found = false;
+				for(let libraryItem of libraryItems) {
+					let libraryTitle = libraryItem.title;
+					// Remove all tags
+					libraryTitle = libraryTitle.replace(/<\/?\w+[^<>]*>/gi, '');
+					libraryTitle = libraryTitle.replace(/:/g, ' ');
+					
+					// Normalize title, split to words, filter out empty array elements
+					libraryTitle = normalize(libraryTitle).split(' ').filter(x => x).join(' ');
+					
+					if(crossrefTitle.includes(libraryTitle)) {
+						found = true;
+						break;
+					}
+				}
+				
+				if(!found) {
+					items.push(crossrefItem);
+				}
+			}
+			
+			return items;
+		}
+		
+		this.formatDescription = function (item) {
+			let parts = [];
+			
+			let authors = [];
+			for (let creator of item.creators) {
+				if (creator.creatorType === 'author' && creator.lastName) {
+					authors.push(creator.lastName);
+					if (authors.length === 3) break;
+				}
+			}
+			
+			if(authors.length) parts.push(authors.join(', '));
+			
+			if (item.date) {
+				let m = item.date.toString().match(/[0-9]{4}/);
+				if (m) parts.push(m[0]);
+			}
+			
+			if(item.publicationTitle) {
+				parts.push(item.publicationTitle);
+			} else if(item.publisher) {
+				parts.push(item.publisher);
+			}
+			
+			return parts.join(' \u2013 ');
+		};
+		
+		async function queryCrossref(query) {
+			let items = [];
+			try {
+				let translate = new Zotero.Translate.Search();
+				// Crossref REST
+				translate.setTranslator("0a61e167-de9a-4f93-a68a-628b48855909");
+				translate.setSearch({query});
+				items = await translate.translate({libraryID: false});
+			}
+			catch (e) {
+				Zotero.debug(e, 2);
+			}
+			return items;
+		}
+		
+		/**
+		 * Queries LoC and if that fails, queries GBV
+		 */
+		async function queryLibraries(query) {
+			let items = [];
+			try {
+				let translate = new Zotero.Translate.Search();
+				// Library of Congress ISBN
+				translate.setTranslator("c070e5a2-4bfd-44bb-9b3c-4be20c50d0d9");
+				translate.setSearch({query});
+				items = await translate.translate({libraryID: false});
+			}
+			catch (e) {
+				Zotero.debug(e, 2);
+				try {
+					let translate = new Zotero.Translate.Search();
+					// Gemeinsamer Bibliotheksverbund ISBN
+					translate.setTranslator("de0eef58-cb39-4410-ada0-6b39f43383f9");
+					translate.setSearch({query});
+					items = await translate.translate({libraryID: false});
+				}
+				catch (e) {
+					Zotero.debug(e, 2);
+				}
+			}
+			return items;
+		}
+		
+		/**
+		 * Decomposes all accents and ligatures,
+		 * filters out symbols that aren't space or alphanumeric,
+		 * and lowercases alphabetic symbols.
+		 */
+		function normalize(text) {
+			let rx = XRegExp('[^\\pL 0-9]', 'g');
+			text = XRegExp.replace(text, rx, '');
+			text = text.normalize('NFKD');
+			text = XRegExp.replace(text, rx, '');
+			text = text.toLowerCase();
+			return text;
+		}
+		
+		/**
+		 * Checks if a given word equals to any of the authors' names
+		 */
+		function hasAuthor(authors, word) {
+			return authors.some(author => {
+				return (author.firstName && normalize(author.firstName).split(' ').includes(word))
+					|| (author.lastName && normalize(author.lastName).split(' ').includes(word));
+			});
+		}
+		
+		/**
+		 * Tries to find the longest common words sequence between
+		 * item title and query text. Query text must include title (or part of it)
+		 * from the beginning. If there are leftover query words, it tries to
+		 * validate them against item metadata (currently only authors and year)
+		 */
+		async function filterResults(items, query) {
+			let filteredItems = [];
+			let select = false;
+
+			// Normalize query, split to words, filter out empty array elements
+			let queryWords = normalize(query).split(' ').filter(x => x);
+			
+			for (let item of items) {
+				let DOI = item.DOI;
+				let ISBN = item.ISBN;
+				
+				if (!DOI && item.extra) {
+					let m = item.extra.match(/DOI: (.*)/);
+					if (m) DOI = m[1];
+				}
+				
+				if (!ISBN && item.extra) {
+					let m = item.extra.match(/ISBN: (.*)/);
+					if (m) ISBN = m[1];
+				}
+				
+				if (!DOI && !ISBN) continue;
+				let title = item.title;
+				// Remove all tags
+				title = title.replace(/<\/?\w+[^<>]*>/gi, '');
+				title = title.replace(/:/g, ' ');
+				
+				// Normalize title, split to words, filter out empty array elements
+				let titleWords = normalize(title).split(' ').filter(x => x);
+				
+				let longestFrom = 0;
+				let longestLen = 0;
+				
+				// Finds the longest common words sequence between query text and item.title
+				for (let i = 0; i < queryWords.length; i++) {
+					for (let j = queryWords.length; j > 0; j--) {
+						let a = queryWords.slice(i, j);
+						for (let k = 0; k < titleWords.length - a.length + 1; k++) {
+							let b = titleWords.slice(k, a.length + k);
+							if (a.length && b.length && a.join(' ') === b.join(' ')) {
+								if (a.length > longestLen) {
+									longestFrom = i;
+									longestLen = b.length;
+								}
+							}
+						}
+					}
+				}
+				
+				// At least two common words sequence must be found between query and title
+				if (longestLen < 1) continue;
+				
+				// Longest common sequence of words
+				let foundPart = queryWords.slice(longestFrom, longestLen);
+				
+				// Remaining words
+				let rems = queryWords.slice(0, longestFrom);
+				rems = rems.concat(queryWords.slice(longestLen));
+				
+				// If at least one remaining word is left, it tries to compare it against item metadata.
+				// Otherwise the whole query text is found in the title, and we have a full match
+				if (rems.length) {
+					let foundAuthor = false;
+					let needYear = false;
+					let foundYear = false;
+					
+					// Still remaining words
+					let rems2 = [];
+					
+					for (let rem of rems) {
+						// Ignore words
+						if (['the', 'a', 'an'].indexOf(rem) >= 0) continue;
+						
+						// If the remaining word has at least 2 chars and exists in metadata authors
+						if (rem.length >= 2 && hasAuthor(item.creators, rem)) {
+							foundAuthor = true;
+							continue;
+						}
+						
+						// If the remaining word is a 4 digit number (year)
+						if (/^[0-9]{4}$/.test(rem)) {
+							needYear = true;
+							
+							if (item.date) {
+								// If the remaining word exists in the item date
+								let m = item.date.toString().match(/[0-9]{4}/);
+								if (m && m[0] === rem) {
+									foundYear = true;
+									continue;
+								}
+							}
+						}
+						
+						// Push the word that is still remaining
+						rems2.push(rem);
+					}
+					
+					// If a year exists in the query, but is not matched to the item date
+					if (needYear && !foundYear) continue;
+					
+					// If there are still remaining words and none of authors are found
+					if (rems2.length && !foundAuthor) continue;
+				}
+				
+				// If the query part that was found in title is shorter than 30 symbols
+				if (foundPart.join(' ').length < 30) select = true;
+				
+				filteredItems.push({
+					matchedLen: foundPart.join(' ').length,
+					titleLen: titleWords.join(' ').length,
+					item
+				});
+			}
+			
+			// Sort results by matched text length
+			// and how close the matched text length is to title length
+			filteredItems.sort(function (a, b) {
+				if (b.matchedLen < a.matchedLen) return -1;
+				if (b.matchedLen > a.matchedLen) return 1;
+				return Math.abs(a.matchedLen - a.titleLen) - Math.abs(b.matchedLen - b.titleLen);
+			});
+			
+			filteredItems = filteredItems.map(item => item.item);
+			
+			return {select, items: filteredItems};
+		}
+		
+		function getLongestCommonSequence(title, query) {
+			title = title.replace(/<\/?\w+[^<>]*>/gi, '');
+			title = title.replace(/:/g, ' ');
+			
+			query = query.replace(/:/g, ' ');
+			
+			// Normalize, split to words and filter out empty array elements
+			let titleWords = normalize(title).split(' ').filter(x => x);
+			let queryWords = normalize(query).split(' ').filter(x => x);
+			
+			let longestFrom = 0;
+			let longestLen = 0;
+			
+			// Finds the longest common words sequence between query text and item.title
+			for (let i = 0; i < queryWords.length; i++) {
+				for (let j = queryWords.length; j > 0; j--) {
+					let a = queryWords.slice(i, j);
+					for (let k = 0; k < titleWords.length - a.length + 1; k++) {
+						let b = titleWords.slice(k, a.length + k);
+						if (a.length && b.length && a.join(' ') === b.join(' ')) {
+							if (a.length > longestLen) {
+								longestFrom = i;
+								longestLen = b.length;
+							}
+						}
+					}
+				}
+			}
+			
+			return queryWords.slice(longestFrom, longestFrom + longestLen).join(' ');
+		}
+		
+		function identifierToToken(identifier) {
+			return Zotero.Utilities.Internal.md5(JSON.stringify(identifier));
+		}
+	},
+};
 
 /**
  * Refreshes the translator directory

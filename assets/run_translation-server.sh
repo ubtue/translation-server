@@ -13,6 +13,24 @@ if [ "${SKIP_TRANSLATOR_UPDATE:-}" != "1" ]; then
 	popd > /dev/null
 fi
 
+# Set CORS allowed origins
+# We have to escape the '//' in the URL.
+perl -pi -e 's/pref\("translation-server.httpServer.allowedOrigins", "[^"]*"\);/pref\("translation-server.httpServer.allowedOrigins", "'$(echo "${ALLOWED_ORIGINS:-}" | sed 's/\//\\\//g')'"\);/g' defaults/pref/config.js
+
+# Set email address from TRANSLATION_EMAIL for use by some translators for better service.
+# We have to escape the '@' so it doesn't get swallowed by Perl.
+perl -pi -e 's/pref\("translation-server.translators.CrossrefREST.email", "[^"]*"\);/pref\("translation-server.translators.CrossrefREST.email", "'$(echo ${TRANSLATION_EMAIL:-} | sed 's/@/\\@/')'"\);/g' defaults/pref/config.js
+
+# Set identifier search endpoint
+# We have to escape the '//' in the URL.
+perl -pi -e 's/pref\("translation-server.identifierSearchURL", "[^"]*"\);/pref\("translation-server.identifierSearchURL", "'$(echo "${IDENTIFIER_SEARCH_URL:-}" | sed 's/\//\\\//g')'"\);/g' defaults/pref/config.js
+
+# Set blacklisted domains
+perl -pi -e 's/pref\("translation-server.blacklistedDomains", "[^"]*"\);/pref\("translation-server.blacklistedDomains", "'$(echo "${BLACKLISTED_DOMAINS:-}")'"\);/g' defaults/pref/config.js
+
+# Enable automatic URL deproxification
+perl -pi -e 's/pref\("translation-server.deproxifyURLs", (true|false)\);/pref\("translation-server.deproxifyURLs", '$(echo "${DEPROXIFY_URLS:-}")'\);/g' defaults/pref/config.js
+
 if [[ "`uname`" == CYGWIN* ]]; then
 	./xpcshell.exe -v 180 -mn app/init.js "$@"
 else

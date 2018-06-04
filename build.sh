@@ -10,6 +10,7 @@ Usage: $0 [-d DIR] [-c DIR]
 Options
  -d DIR              Zotero client build directory to build from instead of using submodule
  -c DIR              Connector directory to build from instead of using submodule
+ -k                  Skip copying of SDK files
 DONE
 	exit 1
 }
@@ -132,9 +133,9 @@ echo "content translation-server app/" >> "$BUILD_DIR/chrome.manifest"
 echo "resource zotero app/resource/" >> "$BUILD_DIR/chrome.manifest"
 echo "locale branding en-US chrome/branding/locale/" >> "$BUILD_DIR/chrome.manifest"
 
-# Copy translators (not applicable to Docker build)
-if [ -d "$SCRIPT_DIR/modules/zotero/translators/" ]; then
-	rsync -a --delete "$SCRIPT_DIR/modules/zotero/translators/" "$BUILD_DIR/app/translators/"
+# Copy translators (doesn't apply to production Docker builds)
+if [ -d "$EXTENSION_DIR/translators" ]; then
+	rsync -a --delete "$EXTENSION_DIR/translators/" "$BUILD_DIR/app/translators/"
 fi
 
 # Add preferences

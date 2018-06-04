@@ -1,3 +1,7 @@
+if (!Zotero.getString) {
+	Zotero.getString = str => str;
+}
+
 Zotero.CookieSandbox.prototype._attachToInterfaceRequestor = Zotero.CookieSandbox.prototype.attachToInterfaceRequestor;
 /**
  * Replaces Zotero.CookieSandbox.prototype.attachToInterfaceRequestor to allow the cookieSandbox
@@ -65,12 +69,11 @@ Zotero.CookieSandbox.prototype.clearTimeout = function() {
 Zotero.HTTP.requestOriginal = Zotero.HTTP.request;
 Zotero.HTTP.request = function (method, url, options = {}) {
 	options = Object.assign(
-		{},
-		options,
 		{
 			dontCache: true,
-			timeout: 15000
-		}
+			timeout: 7000
+		},
+		options
 	);
 	return Zotero.HTTP.requestOriginal(method, url, options);
 };
